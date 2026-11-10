@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "qgent · QQ 通道",
+    "description": "在 QQ 上和 DeepSeek Harness 聊天。回复是工具调用（qq_send / qq_send_file），干活途中就能发进度；新消息可以选择插话（steer）或排队（queue）。"
+  }
+}

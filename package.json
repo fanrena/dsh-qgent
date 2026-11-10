@@ -1,0 +1,56 @@
+{
+  "name": "dsh-qgent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "QQ as an agent channel for DeepSeek Harness: replies are tools, incoming messages steer or queue, status updates go out mid-work.",
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "qgent",
+    "qq",
+    "qqbot",
+    "im",
+    "agent"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fanrena/dsh-qgent.git"
+  },
+  "homepage": "https://github.com/fanrena/dsh-qgent",
+  "bugs": {
+    "url": "https://github.com/fanrena/dsh-qgent/issues"
+  },
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node test/smoke.mjs"
+  },
+  "dependencies": {
+    "@tencent-connect/qqbot-nodejs": "^1.0.5"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  }
+}

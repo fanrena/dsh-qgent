@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "qgent — QQ channel",
+    "description": "Talk to DeepSeek Harness on QQ. Replies are tool calls (qq_send / qq_send_file), so the agent can post progress mid-work; new messages steer the running turn or queue for the next one."
+  }
+}

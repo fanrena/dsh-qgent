@@ -1,0 +1,53 @@
+# qgent — QQ 作为 agent 通道。
+#
+# 和 dsh-qqbot 的关键区别：回复不再自动发出去，而是 qq_send / qq_send_file 两个
+# 工具；收到新消息时按 mode 决定「插话」(steer) 还是「排队」(queue)。
+#
+# 凭据：appId / appSecret 留空时，先读 QQBOT_APPID / QQBOT_SECRET 环境变量，
+# 再从当前 profile 里已绑定的 im-qqbot 行继承（inheritQQBot: true）。
+#
+# 注意：同一个 AppID 不能同时跑 dsh-qqbot 和 qgent，记得 disable 掉 dsh-qqbot。
+- insert:
+    - id: qgent
+      name: dsh-qgent
+      config:
+        appId: ''
+        appSecret: ''
+        # 没配凭据时，从当前 profile 的 im-qqbot 行继承（扫码绑定过的话直接可用）
+        inheritQQBot: true
+        # 群聊里是否必须 @ 才触发。false = 每条群消息都进模型，由模型自己决定要不要 qq_send
+        requireMention: false
+        # 收到新消息时的默认投递方式：steer（干活中间插话）| queue（当前这轮干完再处理）
+        mode: steer
+        # 模型一轮说完却没调用任何 qq_send 时，把最后一条回答补发到 QQ（兜底，避免对方一直干等）
+        fallbackReply: true
+        # 用 markdown 发（失败自动退回纯文本）
+        markdown: true
+        # 单条 QQ 消息最大字符数，超了自动分段
+        textChunkLimit: 4500
+        # 会话空闲多久回收（毫秒）
+        sessionIdleTimeout: 1800000
+        # 群历史缓冲条数（作为上下文带给模型）
+        historyLimit: 10
+        # agent 的工作目录；留空 = Host 进程的 cwd
+        cwd: ''
+        # 可选：指定 agent preset / 模型；留空 = 宿主默认
+        preset: ''
+        provider: ''
+        model: ''
+        # 群聊额外人设/提示词（追加到 qgent 通道说明后面）
+        groupPrompt: ''
+        # 私聊额外人设/提示词
+        directPrompt: ''
+        access:
+          c2cMode: open
+          c2cAllow: []
+          groupMode: open
+          groupAllow: []
+        media:
+          enabled: true
+          maxMB: 200
+        sendFile:
+          restrictPaths: true
+          extraRoots: []
+        debug: false
