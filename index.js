@@ -43,6 +43,8 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const DSH_HOME = process.env.DSH_HOME ?? join(homedir(), '.dsh')
 const STATE_DIR = join(DSH_HOME, 'qgent')
 const MEDIA_DIR = join(STATE_DIR, 'media')
+/** Per-chat generation counters: `/new` bumps the number, which changes the session id. */
+const CHAT_STATE_FILE = join(STATE_DIR, 'chats.json')
 
 /** QQ passive replies are limited per inbound message; beyond this we push. */
 const PASSIVE_REPLY_LIMIT = 4
@@ -68,6 +70,8 @@ const DEFAULTS = {
   textChunkLimit: 4500,
   sessionIdleTimeout: 30 * 60 * 1000,
   historyLimit: 10,
+  /** Inbound turns allowed per chat per minute (stops bot-to-bot ping-pong). */
+  maxTurnsPerMinute: 8,
   cwd: '',
   preset: '',
   provider: '',
@@ -166,6 +170,7 @@ export function normalizeConfig(raw) {
     textChunkLimit: count(input.textChunkLimit, DEFAULTS.textChunkLimit, 200),
     sessionIdleTimeout: count(input.sessionIdleTimeout, DEFAULTS.sessionIdleTimeout, 60_000),
     historyLimit: count(input.historyLimit, DEFAULTS.historyLimit, 0),
+    maxTurnsPerMinute: count(input.maxTurnsPerMinute, DEFAULTS.maxTurnsPerMinute, 1),
     cwd: str(input.cwd),
     preset: str(input.preset),
     provider: str(input.provider),
@@ -675,6 +680,43 @@ function deriveSessionId(key) {
 }
 
 /**
+ * Durable per-chat generation counters.
+ *
+ * `/new` bumps a chat's generation, which changes the derived session id: the
+ * next message creates a fresh session instead of resuming the old one. The old
+ * session's log stays on disk untouched, so its history is archived rather than
+ * deleted.
+ */
+class ChatState {
+  constructor(file) {
+    this.file = file
+    this.data = { gens: {} }
+    try {
+      const parsed = JSON.parse(readFileSync(file, 'utf8'))
+      if (parsed !== null && typeof parsed === 'object' && parsed.gens !== null && typeof parsed.gens === 'object') {
+        this.data = { gens: parsed.gens }
+      }
+    } catch {}
+  }
+
+  gen(chatId) {
+    const value = Number(this.data.gens[chatId])
+    return Number.isInteger(value) && value >= 0 ? value : 0
+  }
+
+  bump(chatId) {
+    this.data.gens[chatId] = this.gen(chatId) + 1
+    try {
+      mkdirSync(dirname(this.file), { recursive: true })
+      writeFileSync(this.file, `${JSON.stringify(this.data, null, 2)}\n`)
+    } catch {
+      // Losing the counter only means a restart resumes the previous generation.
+    }
+    return this.data.gens[chatId]
+  }
+}
+
+/**
  * Map one QQ chat to one host session and deliver prompts into it.
  *
  * Creation mirrors what a channel plugin has to do: resume the persisted
@@ -690,6 +732,8 @@ class QQSessionManager {
     this.chats = chats
     this.sessions = new Map()
     this.pending = new Map()
+    this.state = new ChatState(CHAT_STATE_FILE)
+    this.turnTimes = new Map()
     const fallbackDirectory = this.ctx.get('workingDirectory')?.defaultDirectory
     this.cwd = config.cwd !== ''
       ? resolvePath(config.cwd)
@@ -702,7 +746,45 @@ class QQSessionManager {
   }
 
   key(scope, peerId) {
-    return `qgent:${this.appLabel}:${scope}:${peerId}`
+    const chatId = chatKey(scope, peerId)
+    return `qgent:${this.appLabel}:${chatId}:${this.state.gen(chatId)}`
+  }
+
+  /** The live record currently bound to a chat, if any. */
+  currentRecord(scope, peerId) {
+    return this.sessions.get(this.key(scope, peerId))
+  }
+
+  /**
+   * `/new`: dispose the bound agent and point the chat at a fresh generation.
+   * The previous session's log is left on disk; nothing is deleted.
+   */
+  async rotate(scope, peerId) {
+    const record = this.currentRecord(scope, peerId)
+    if (record !== undefined) {
+      this.sessions.delete(record.key)
+      try {
+        record.agent.cancel({ kind: 'user' })
+      } catch {}
+      await record.handle?.dispose?.().catch(() => {})
+    }
+    const generation = this.state.bump(chatKey(scope, peerId))
+    this.log.info(`qgent: new session for ${chatKey(scope, peerId)} (generation ${generation})`)
+    return generation
+  }
+
+  /** Reserve one inbound turn slot per chat (stops bot-to-bot ping-pong). */
+  allowTurn(scope, peerId) {
+    const chatId = chatKey(scope, peerId)
+    const now = Date.now()
+    const recent = (this.turnTimes.get(chatId) ?? []).filter(time => now - time < 60_000)
+    if (recent.length >= this.config.maxTurnsPerMinute) {
+      this.turnTimes.set(chatId, recent)
+      return false
+    }
+    recent.push(now)
+    this.turnTimes.set(chatId, recent)
+    return true
   }
 
   findByAgent(agent) {
@@ -1043,7 +1125,7 @@ class QQChannel {
     bot.use(sdk.errorHandler({
       format: error => `⚠️ 处理消息时出错：${error instanceof Error ? error.message : String(error)}`,
     }))
-    bot.use(sdk.messageFilter({ skipSelfEcho: false }))
+    bot.use(sdk.messageFilter({ skipSelfEcho: true }))
     bot.use(sdk.accessPolicy({
       c2c: {
         mode: this.config.access.c2cMode,
@@ -1073,9 +1155,37 @@ class QQChannel {
     // The chat label names the conversation (a group has no name in the event,
     // only its openid); the message header names the person who spoke.
     const chatLabel = scope === 'group' ? `群 ${shortId(peerId)}` : senderLabel
-    const parsed = parseModePrefix(message.content ?? '', this.config.mode)
+    let parsed = parseModePrefix(message.content ?? '', this.config.mode)
     const replyTarget = { scope, targetId: peerId, msgId: message.messageId }
     this.chats.touch({ scope, peerId, label: chatLabel, msgId: message.messageId })
+    const entry = this.chats.get(chatKey(scope, peerId))
+    // /new (alias /reset) rebinds the chat to a fresh session; /stop cancels the
+    // running turn. Both are handled here, before the model ever sees the text.
+    const command = /^\/(new|reset|stop)\b\s*([\s\S]*)$/i.exec(parsed.text)
+    if (command !== null) {
+      const word = command[1].toLowerCase()
+      if (word === 'stop') {
+        const record = this.sessions.currentRecord(scope, peerId)
+        if (record === undefined) {
+          await this.sendText(entry, '现在没有在跑的回合。').catch(() => {})
+          return
+        }
+        try {
+          record.agent.cancel({ kind: 'user' })
+        } catch {}
+        await this.sendText(entry, '⏹ 已打断当前回合。').catch(() => {})
+        return
+      }
+      const generation = await this.sessions.rotate(scope, peerId)
+      await this.sendText(entry, `🔄 新会话（第 ${generation + 1} 代）。旧记录还在磁盘上，只是不再参与。`).catch(() => {})
+      const rest = command[2].trim()
+      if (rest === '') return
+      parsed = { text: rest, mode: parsed.mode }
+    }
+    if (!this.sessions.allowTurn(scope, peerId)) {
+      this.log.debug(`qgent: ${chatKey(scope, peerId)} exceeded ${this.config.maxTurnsPerMinute} turns/minute; dropping`)
+      return
+    }
     const body = await composeInbound({
       message,
       state: mCtx.state,
