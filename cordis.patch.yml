@@ -29,8 +29,6 @@
         sessionIdleTimeout: 1800000
         # 群历史缓冲条数（作为上下文带给模型）
         historyLimit: 10
-        # 每个聊天每分钟最多进模型多少条（防两个 bot 互相接话的乒乓循环）
-        maxTurnsPerMinute: 8
         # agent 的工作目录；留空 = Host 进程的 cwd
         cwd: ''
         # 可选：指定 agent preset / 模型；留空 = 宿主默认

@@ -146,7 +146,7 @@ QQ SDK 依赖 `@tencent-connect/qqbot-nodejs`。插件会依次从「宿主解�
 
 - 只处理私聊（C2C）和群聊；频道/频道私信忽略。
 - 一个 AppID 只能跑一个实例；多开没有做分片。
-- 群聊里如果有**别的机器人**也在说话，而 QQ 又把它们的消息投给本 bot，两边会互相接话。qgent 默认丢掉 `senderIsBot` 的消息（`messageFilter.skipSelfEcho`），并且每个聊天每分钟最多放 `maxTurnsPerMinute` 条进模型（默认 8），超了就静默丢弃——这只是兜底，真出现对刷就把其中一个 bot 移出群。
+- 群聊里如果有**别的机器人**也在说话，QQ 又把这些消息投给本 bot，两个 bot 会互相接话、上下文越滚越重复，最后模型可能退化成复读或乱吐字符。qgent 没有做 bot 消息过滤或入站限流（`skipSelfEcho: false`），真出现对刷就把其中一个 bot 移出群，或者用 `/stop` 打断。
 - `steer` 的"下一步"取决于 agent 当前这一步什么时候结束：模型正在生成长回答时，插话要等这次生成结束。
 - 会话的 preset 在首次创建时确定；之后改 `preset` 只影响新会话。
 

@@ -70,8 +70,6 @@ const DEFAULTS = {
   textChunkLimit: 4500,
   sessionIdleTimeout: 30 * 60 * 1000,
   historyLimit: 10,
-  /** Inbound turns allowed per chat per minute (stops bot-to-bot ping-pong). */
-  maxTurnsPerMinute: 8,
   cwd: '',
   preset: '',
   provider: '',
@@ -170,7 +168,6 @@ export function normalizeConfig(raw) {
     textChunkLimit: count(input.textChunkLimit, DEFAULTS.textChunkLimit, 200),
     sessionIdleTimeout: count(input.sessionIdleTimeout, DEFAULTS.sessionIdleTimeout, 60_000),
     historyLimit: count(input.historyLimit, DEFAULTS.historyLimit, 0),
-    maxTurnsPerMinute: count(input.maxTurnsPerMinute, DEFAULTS.maxTurnsPerMinute, 1),
     cwd: str(input.cwd),
     preset: str(input.preset),
     provider: str(input.provider),
@@ -733,7 +730,6 @@ class QQSessionManager {
     this.sessions = new Map()
     this.pending = new Map()
     this.state = new ChatState(CHAT_STATE_FILE)
-    this.turnTimes = new Map()
     const fallbackDirectory = this.ctx.get('workingDirectory')?.defaultDirectory
     this.cwd = config.cwd !== ''
       ? resolvePath(config.cwd)
@@ -773,19 +769,8 @@ class QQSessionManager {
     return generation
   }
 
-  /** Reserve one inbound turn slot per chat (stops bot-to-bot ping-pong). */
-  allowTurn(scope, peerId) {
-    const chatId = chatKey(scope, peerId)
-    const now = Date.now()
-    const recent = (this.turnTimes.get(chatId) ?? []).filter(time => now - time < 60_000)
-    if (recent.length >= this.config.maxTurnsPerMinute) {
-      this.turnTimes.set(chatId, recent)
-      return false
-    }
-    recent.push(now)
-    this.turnTimes.set(chatId, recent)
-    return true
-  }
+
+
 
   findByAgent(agent) {
     if (agent === undefined || agent === null) return undefined
@@ -1125,7 +1110,7 @@ class QQChannel {
     bot.use(sdk.errorHandler({
       format: error => `⚠️ 处理消息时出错：${error instanceof Error ? error.message : String(error)}`,
     }))
-    bot.use(sdk.messageFilter({ skipSelfEcho: true }))
+    bot.use(sdk.messageFilter({ skipSelfEcho: false }))
     bot.use(sdk.accessPolicy({
       c2c: {
         mode: this.config.access.c2cMode,
@@ -1181,10 +1166,6 @@ class QQChannel {
       const rest = command[2].trim()
       if (rest === '') return
       parsed = { text: rest, mode: parsed.mode }
-    }
-    if (!this.sessions.allowTurn(scope, peerId)) {
-      this.log.debug(`qgent: ${chatKey(scope, peerId)} exceeded ${this.config.maxTurnsPerMinute} turns/minute; dropping`)
-      return
     }
     const body = await composeInbound({
       message,
