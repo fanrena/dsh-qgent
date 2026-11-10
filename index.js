@@ -597,21 +597,24 @@ function sanitizeFilename(name) {
 /**
  * Build the text the agent reads for one inbound QQ message.
  *
- * The header names the chat and the sender; the footer is the one instruction
- * that matters most (nothing reaches QQ unless a tool sends it). Quoted
- * messages, group history and downloaded attachments follow.
+ * No envelope and no per-message reminder: the session's system prompt already
+ * binds it to QQ and says `qq_send` is the only way out. What remains is the
+ * message as a chat would show it — a sender prefix in groups, quoted text and
+ * downloaded attachments when present.
  */
-async function composeInbound({ message, state, scope, label, senderId, text, config, log }) {
+async function composeInbound({ message, state, scope, label, text, config, log }) {
   const lines = []
   const mentioned = state?.mention?.wasMentioned === true
-  lines.push(scope === 'group'
-    ? `[QQ 群聊] ${label} (${senderId})${mentioned ? ' · @你' : ''}`
-    : `[QQ 私聊] ${label} (${senderId})`)
   const quote = state?.quote
   if (quote !== undefined && typeof quote.text === 'string' && quote.text.trim() !== '') {
-    lines.push('[引用消息]', quote.text.trim(), '[当前消息]')
+    lines.push('[引用]', quote.text.trim(), '[当前]')
   }
-  if (text.trim() !== '') lines.push(text.trim())
+  const body = text.trim()
+  if (body !== '') {
+    lines.push(scope === 'group' ? `${label}${mentioned ? ' (@你)' : ''}: ${body}` : body)
+  } else if (mentioned) {
+    lines.push(`${label} (@你)`)
+  }
   const history = Array.isArray(state?.history) ? state.history : []
   const previous = history.filter(item => item?.messageId !== message.messageId)
   // Only mention-gated groups lose messages before they reach the session; when
@@ -644,9 +647,7 @@ async function composeInbound({ message, state, scope, label, senderId, text, co
     const asr = typeof voice.asr_refer_text === 'string' ? voice.asr_refer_text.trim() : ''
     if (asr !== '') lines.push(`[语音] ${asr}`)
   }
-  if (text.trim() === '' && media.length === 0 && voices.length === 0 && quote === undefined && !mentioned) return ''
-  lines.push('', '（要回话就调用 qq_send；你写的普通文字不会发到 QQ。）')
-  return lines.join('\n')
+  return lines.length === 0 ? '' : lines.join('\n')
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1053,7 +1054,6 @@ class QQChannel {
       state: mCtx.state,
       scope,
       label: senderLabel,
-      senderId,
       text: parsed.text,
       config: this.config,
       log: this.log,
