@@ -614,7 +614,10 @@ async function composeInbound({ message, state, scope, label, senderId, text, co
   if (text.trim() !== '') lines.push(text.trim())
   const history = Array.isArray(state?.history) ? state.history : []
   const previous = history.filter(item => item?.messageId !== message.messageId)
-  if (scope === 'group' && config.historyLimit > 0 && previous.length > 0) {
+  // Only mention-gated groups lose messages before they reach the session; when
+  // every group message becomes a turn, the session log already holds this
+  // history and repeating it here would duplicate the conversation.
+  if (scope === 'group' && config.requireMention && config.historyLimit > 0 && previous.length > 0) {
     const recent = previous.slice(-config.historyLimit)
     lines.push('', '[群里最近]')
     for (const item of recent) {

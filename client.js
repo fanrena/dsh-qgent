@@ -300,7 +300,7 @@ window.__ModuleLoader__.load({
           ],
           onChange: value => set('mode', value),
         }),
-        h('p', { className: 'qg-help' }, 'steer 在当前回合的下一步插进来，边干边回；queue 等这轮干完再处理。'),
+        h('p', { className: 'qg-help' }, 'steer 在当前回合的下一步插进来，边干边回；queue 等这轮干完再处理。对方也可以在消息前加 #steer / #queue 临时改这一条。'),
       ),
       h(SwitchField, {
         label: '没调用 qq_send 时补发最后一条',
