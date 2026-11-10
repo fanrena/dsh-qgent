@@ -633,6 +633,25 @@ function escapeRegExp(value) {
  * message as a chat would show it — the sender's openid as the stable identity,
  * quoted text and downloaded attachments when present.
  */
+/**
+ * Remove the bot's own @mention from inbound text.
+ *
+ * Prefers the structured `is_you` mention (its openid), and when the payload
+ * has no such flag but the gate says the bot was mentioned, drops the leading
+ * marker — that is the one that triggered the reply.
+ */
+function stripSelfMention(text, message, mentioned) {
+  const mention = Array.isArray(message?.mentions) ? message.mentions.find(item => item?.is_you === true) : undefined
+  const selfId = mention?.user_openid ?? mention?.member_openid ?? mention?.id
+  let value = String(text ?? '')
+  if (typeof selfId === 'string' && selfId !== '') {
+    value = value.replace(new RegExp(`<@!?${escapeRegExp(selfId)}>\\s*`, 'g'), '')
+  } else if (mentioned === true) {
+    value = value.replace(/^\s*<@!?[^>]{1,64}>\s*/, '')
+  }
+  return value
+}
+
 async function composeInbound({ message, state, scope, label, senderId, text, config, log }) {
   const lines = []
   const mentioned = state?.mention?.wasMentioned === true
@@ -642,11 +661,7 @@ async function composeInbound({ message, state, scope, label, senderId, text, co
   }
   // The bot's own mention marker is noise: `(@你)` already says the message was
   // addressed to it. Markers naming other people stay — they are identities.
-  const selfMention = Array.isArray(message.mentions) ? message.mentions.find(item => item?.is_you === true) : undefined
-  const selfId = selfMention?.user_openid ?? selfMention?.member_openid ?? selfMention?.id
-  const body = (typeof selfId === 'string' && selfId !== ''
-    ? text.replace(new RegExp(`<@!?${escapeRegExp(selfId)}>\\s*`, 'g'), '')
-    : text).trim()
+  const body = stripSelfMention(text, message, mentioned).trim()
   const who = `<@${senderId}>`
   if (body !== '') {
     // Groups carry the sender's stable openid in the platform's own mention
@@ -1328,11 +1343,8 @@ class QQChannel {
     // The event content still carries `<@bot-openid>` when someone @-mentions the
     // bot. Strip it before parsing, or `/ping` looks like ordinary text and goes
     // to the model instead of the command handler.
-    const selfMention = Array.isArray(message.mentions) ? message.mentions.find(item => item?.is_you === true) : undefined
-    const selfId = selfMention?.user_openid ?? selfMention?.member_openid ?? selfMention?.id
-    const rawContent = typeof selfId === 'string' && selfId !== ''
-      ? String(message.content ?? '').replace(new RegExp(`<@!?${escapeRegExp(selfId)}>\\s*`, 'g'), '')
-      : String(message.content ?? '')
+    const mentioned = mCtx.state?.mention?.wasMentioned === true
+    const rawContent = stripSelfMention(message.content ?? '', message, mentioned)
     let parsed = parseModePrefix(rawContent, this.config.mode)
     const replyTarget = { scope, targetId: peerId, msgId: message.messageId }
     this.chats.touch({ scope, peerId, label: chatLabel, msgId: message.messageId })
