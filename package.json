@@ -40,10 +40,14 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node test/smoke.mjs"
+    "test": "node test/smoke.mjs && node test/client-smoke.mjs"
   },
   "dependencies": {
     "@tencent-connect/qqbot-nodejs": "^1.0.5"
+  },
+  "devDependencies": {
+    "react": "18.3.1",
+    "react-test-renderer": "18.3.1"
   },
   "dsh": {
     "bundle": {
