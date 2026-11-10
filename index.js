@@ -602,7 +602,7 @@ function sanitizeFilename(name) {
  * message as a chat would show it — a sender prefix in groups, quoted text and
  * downloaded attachments when present.
  */
-async function composeInbound({ message, state, scope, label, text, config, log }) {
+async function composeInbound({ message, state, scope, label, senderId, text, config, log }) {
   const lines = []
   const mentioned = state?.mention?.wasMentioned === true
   const quote = state?.quote
@@ -610,10 +610,13 @@ async function composeInbound({ message, state, scope, label, text, config, log 
     lines.push('[引用]', quote.text.trim(), '[当前]')
   }
   const body = text.trim()
+  const who = `<@${senderId}>`
   if (body !== '') {
-    lines.push(scope === 'group' ? `${label}${mentioned ? ' (@你)' : ''}: ${body}` : body)
+    // Groups carry the sender's stable openid in the platform's own mention
+    // syntax: nicknames change, this does not.
+    lines.push(scope === 'group' ? `${who} ${label}${mentioned ? ' (@你)' : ''}: ${body}` : body)
   } else if (mentioned) {
-    lines.push(`${label} (@你)`)
+    lines.push(`${who} ${label} (@你)`)
   }
   const history = Array.isArray(state?.history) ? state.history : []
   const previous = history.filter(item => item?.messageId !== message.messageId)
@@ -624,8 +627,8 @@ async function composeInbound({ message, state, scope, label, text, config, log 
     const recent = previous.slice(-config.historyLimit)
     lines.push('', '[群里最近]')
     for (const item of recent) {
-      const who = item.senderName ?? shortId(item.senderId)
-      lines.push(`${who}: ${String(item.content ?? '').trim()}`)
+      const name = item.senderName ?? shortId(item.senderId)
+      lines.push(`<@${item.senderId}> ${name}: ${String(item.content ?? '').trim()}`)
     }
   }
   const attachments = Array.isArray(message.attachments) ? message.attachments : []
@@ -1031,7 +1034,7 @@ class QQChannel {
     }))
     bot.use(sdk.historyBuffer({ limit: this.config.historyLimit }))
     bot.use(sdk.mentionGate({ requireMentionInGroup: this.config.requireMention }))
-    bot.use(sdk.contentSanitizer({ parseFaceTags: true }))
+    bot.use(sdk.contentSanitizer({ parseFaceTags: true, stripAllMentions: false }))
   }
 
   /** One inbound QQ message → one prompt delivered into its session. */
@@ -1054,6 +1057,7 @@ class QQChannel {
       state: mCtx.state,
       scope,
       label: senderLabel,
+      senderId,
       text: parsed.text,
       config: this.config,
       log: this.log,
