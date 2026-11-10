@@ -87,20 +87,20 @@ assert.ok(text.includes('190600'), 'app id renders')
 assert.ok(text.includes('保存配置'), 'save button renders')
 assert.ok(text.includes('群人设'), 'group prompt renders')
 
-function findButton(node, label) {
+function findForm(node) {
   if (node === null || typeof node !== 'object') return undefined
-  if (node.type === 'button' && JSON.stringify(node.children).includes(label)) return node
+  if (node.type === 'form') return node
   for (const child of node.children ?? []) {
-    const hit = findButton(child, label)
+    const hit = findForm(child)
     if (hit !== undefined) return hit
   }
   return undefined
 }
 
-const save = findButton(tree, '保存配置')
-assert.ok(save !== undefined, 'save button is reachable')
+const form = findForm(tree)
+assert.ok(form !== undefined, 'the settings form is rendered')
 await TestRenderer.act(async () => {
-  save.props.onClick()
+  form.props.onSubmit({ preventDefault() {} })
   await new Promise(resolve => setTimeout(resolve, 0))
 })
 const posted = calls.find(call => call.url === '/qgent/config' && call.options?.method === 'POST')
