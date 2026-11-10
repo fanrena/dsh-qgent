@@ -594,13 +594,18 @@ function sanitizeFilename(name) {
   return base === '' ? 'attachment' : base.normalize('NFC')
 }
 
+/** Escape one literal for use inside a RegExp. */
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
 /**
  * Build the text the agent reads for one inbound QQ message.
  *
  * No envelope and no per-message reminder: the session's system prompt already
  * binds it to QQ and says `qq_send` is the only way out. What remains is the
- * message as a chat would show it — a sender prefix in groups, quoted text and
- * downloaded attachments when present.
+ * message as a chat would show it — the sender's openid as the stable identity,
+ * quoted text and downloaded attachments when present.
  */
 async function composeInbound({ message, state, scope, label, senderId, text, config, log }) {
   const lines = []
@@ -609,7 +614,13 @@ async function composeInbound({ message, state, scope, label, senderId, text, co
   if (quote !== undefined && typeof quote.text === 'string' && quote.text.trim() !== '') {
     lines.push('[引用]', quote.text.trim(), '[当前]')
   }
-  const body = text.trim()
+  // The bot's own mention marker is noise: `(@你)` already says the message was
+  // addressed to it. Markers naming other people stay — they are identities.
+  const selfMention = Array.isArray(message.mentions) ? message.mentions.find(item => item?.is_you === true) : undefined
+  const selfId = selfMention?.user_openid ?? selfMention?.member_openid ?? selfMention?.id
+  const body = (typeof selfId === 'string' && selfId !== ''
+    ? text.replace(new RegExp(`<@!?${escapeRegExp(selfId)}>\\s*`, 'g'), '')
+    : text).trim()
   const who = `<@${senderId}>`
   if (body !== '') {
     // Groups carry the sender's stable openid in the platform's own mention
