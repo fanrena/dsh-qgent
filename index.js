@@ -812,6 +812,27 @@ class QQSessionManager {
   }
 
   /**
+   * Attach a session to the registered workspace whose path is the agent cwd.
+   *
+   * `agents.create` gives a session a cwd but no workspace membership, which is
+   * why the GUI lists it under 未分组. Attaching is what makes the workspace
+   * list (and its permission rows) show it.
+   */
+  async attachWorkspace(sessionId) {
+    try {
+      const registry = this.ctx.get('workspaceRegistry')
+      if (registry === undefined || typeof registry.resolveByPath !== 'function') return
+      const workspace = await registry.resolveByPath(this.cwd)
+      if (workspace === undefined || typeof workspace.attachSession !== 'function') return
+      if (Array.isArray(workspace.sessionIds) && workspace.sessionIds.includes(sessionId)) return
+      await workspace.attachSession(sessionId)
+      this.log.info(`qgent: session ${shortId(sessionId)} attached to workspace ${workspace.id ?? workspace.path}`)
+    } catch (error) {
+      this.log.warn(`qgent: workspace attach failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  /**
    * `/new`: dispose the bound agent and point the chat at a fresh generation.
    * The previous session's log is left on disk; nothing is deleted.
    */
@@ -914,6 +935,7 @@ class QQSessionManager {
         }
       }
     }
+    await this.attachWorkspace(sessionId)
     const record = {
       key,
       sessionId,
@@ -1037,6 +1059,7 @@ class QQSessionManager {
     record.handle = created
     this.state.set('sessions', chatKey(scope, peerId), childId)
     this.state.set('models', chatKey(scope, peerId), `${route.provider}/${route.model}`)
+    await this.attachWorkspace(childId)
     if (oldHandle !== undefined) Promise.resolve(oldHandle.dispose?.()).catch(() => {})
     this.log.info(`qgent: model switched for ${chatKey(scope, peerId)} → ${route.provider}/${route.model} (fork ${childId})`)
     return childId
