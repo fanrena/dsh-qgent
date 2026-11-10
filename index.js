@@ -1325,13 +1325,21 @@ class QQChannel {
     // The chat label names the conversation (a group has no name in the event,
     // only its openid); the message header names the person who spoke.
     const chatLabel = scope === 'group' ? `群 ${shortId(peerId)}` : senderLabel
-    let parsed = parseModePrefix(message.content ?? '', this.config.mode)
+    // The event content still carries `<@bot-openid>` when someone @-mentions the
+    // bot. Strip it before parsing, or `/ping` looks like ordinary text and goes
+    // to the model instead of the command handler.
+    const selfMention = Array.isArray(message.mentions) ? message.mentions.find(item => item?.is_you === true) : undefined
+    const selfId = selfMention?.user_openid ?? selfMention?.member_openid ?? selfMention?.id
+    const rawContent = typeof selfId === 'string' && selfId !== ''
+      ? String(message.content ?? '').replace(new RegExp(`<@!?${escapeRegExp(selfId)}>\\s*`, 'g'), '')
+      : String(message.content ?? '')
+    let parsed = parseModePrefix(rawContent, this.config.mode)
     const replyTarget = { scope, targetId: peerId, msgId: message.messageId }
     this.chats.touch({ scope, peerId, label: chatLabel, msgId: message.messageId })
     const entry = this.chats.get(chatKey(scope, peerId))
     // /new (alias /reset) rebinds the chat to a fresh session; /stop cancels the
     // running turn. Both are handled here, before the model ever sees the text.
-    const command = /^\/(new|reset|clear|stop|status|model|preset|compact|ping|version|help|bot-help)\b\s*([\s\S]*)$/i.exec(parsed.text)
+    const command = /^\s*(?:<@[^>]{1,64}>\s*)*\/(new|reset|clear|stop|status|model|preset|compact|ping|version|help|bot-help)\b\s*([\s\S]*)$/i.exec(parsed.text)
     if (command !== null) {
       const outcome = await this.runCommand(command[1].toLowerCase(), command[2].trim(), scope, peerId, entry)
       if (outcome.handled) {
