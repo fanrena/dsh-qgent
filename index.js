@@ -822,7 +822,20 @@ class QQSessionManager {
     try {
       const registry = this.ctx.get('workspaceRegistry')
       if (registry === undefined || typeof registry.resolveByPath !== 'function') return
-      const workspace = await registry.resolveByPath(this.cwd)
+      let workspace = await registry.resolveByPath(this.cwd)
+      if (workspace === undefined) {
+        // Auto-register a real folder that isn't a workspace yet, but never the
+        // DSH home/profile directories — those would show up as junk workspaces.
+        const home = str(process.env.DSH_HOME) || join(homedir(), '.dsh')
+        if (isInside(home, this.cwd)) return
+        let isDirectory = false
+        try {
+          isDirectory = statSync(this.cwd).isDirectory()
+        } catch {}
+        if (!isDirectory || typeof registry.create !== 'function') return
+        workspace = await registry.create(this.cwd)
+        this.log.info(`qgent: registered workspace for ${this.cwd}`)
+      }
       if (workspace === undefined || typeof workspace.attachSession !== 'function') return
       if (Array.isArray(workspace.sessionIds) && workspace.sessionIds.includes(sessionId)) return
       await workspace.attachSession(sessionId)
