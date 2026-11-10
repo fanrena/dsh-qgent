@@ -193,8 +193,18 @@ window.__ModuleLoader__.load({
       const [secret, setSecret] = React.useState('')
 
       const reload = React.useCallback(async () => {
+        const fetchAll = () => Promise.all([api('/qgent/status'), api('/qgent/config')])
         try {
-          const [nextStatus, nextConfig] = await Promise.all([api('/qgent/status'), api('/qgent/config')])
+          let result
+          try {
+            result = await fetchAll()
+          } catch {
+            // A plugin reload can briefly unregister the routes; one delayed
+            // retry covers that window instead of showing a 404.
+            await new Promise(resolve => setTimeout(resolve, 700))
+            result = await fetchAll()
+          }
+          const [nextStatus, nextConfig] = result
           setStatus(nextStatus)
           setForm(nextConfig.config)
           setAppId(nextConfig.config.appId ?? '')

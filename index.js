@@ -1447,8 +1447,6 @@ async function readJsonBody(req, limit = 65536) {
  * the Loader hot-reloads with the new configuration.
  */
 function installSettingsRoutes(ctx, { settings, credentials, log, channel }) {
-  const webServer = ctx.get('webServer')
-  if (webServer === undefined || typeof webServer.register !== 'function') return
   const rowId = 'qgent'
 
   // Settings endpoints for the panel that ships with this package.
@@ -1542,7 +1540,23 @@ function installSettingsRoutes(ctx, { settings, credentials, log, channel }) {
       },
     },
   ]
-  for (const route of routes) ctx.effect(() => webServer.register(route))
+  // `inject` (rather than a one-shot get) keeps the panel working when the Web
+  // carrier mounts after this plugin, and re-registers after every reload —
+  // a missing carrier at apply time used to leave the page with a 404.
+  ctx.inject(['webServer'], scoped => {
+    const webServer = scoped.webServer
+    if (webServer === undefined || typeof webServer.register !== 'function') return
+    for (const route of routes) {
+      scoped.effect(() => {
+        try {
+          return webServer.register(route)
+        } catch (error) {
+          log.warn(`qgent: cannot register ${route.path}: ${error instanceof Error ? error.message : String(error)}`)
+          return () => {}
+        }
+      })
+    }
+  })
 }
 
 // ────────────────────────────────────────────────────────────────────────────
