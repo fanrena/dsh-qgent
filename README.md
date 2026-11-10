@@ -40,16 +40,22 @@
 
 ## 聊天里的命令
 
-在 QQ 里直接发（不用 @ 也行，按群设置）：
+在 QQ 里直接发（不用 @ 也行，按群设置）；命令在进模型之前就被拦下，不消耗回合：
 
 | 命令 | 作用 |
 | --- | --- |
-| `/new`（或 `/reset`） | 给这个聊天开一个新会话：换一代 session id，旧上下文不再参与。**旧记录不会被删**——它还是磁盘上的一个普通 session，能在 DSH 的会话列表里翻到 |
+| `/new`（别名 `/reset` `/clear`） | 给这个聊天开新会话：换一代 session id，旧上下文不再参与。**旧记录不会被删**——它还是磁盘上的一个普通 session，能在 DSH 的会话列表里翻到 |
 | `/stop` | 打断当前正在跑的回合（相当于 Ctrl+C），不动会话绑定 |
+| `/status` | 连接状态、当前会话、模型、preset、消息数 |
+| `/model [provider/model]` | 不带参数列可用模型；带参数换模型（fork 当前会话，上下文保留） |
+| `/preset [id]` | 列 preset / 选 preset，**下一条 `/new` 生效**（已开始的会话不换） |
+| `/compact` | 原地压缩当前会话历史，返回压缩条数/tokens |
+| `/ping` `/version` | pong / 版本号 |
+| `/help`（`/bot-help`） | 命令表 |
 
 `/new 顺便看下 xxx` 这种带内容的写法，会在开新会话后把 `顺便看下 xxx` 作为新会话的第一条消息。
 
-实现上，qgent 在 `~/.dsh/qgent/chats.json` 里给每个聊天记一个「代数」，session id 由 `qgent:<appId>:<scope>:<peerId>:<代数>` 哈希出来——代数一变，下一条消息就新建会话，而不是 resume 旧的。
+实现上，qgent 在 `~/.dsh/qgent/chats.json` 里给每个聊天记「代数」和几个覆盖项（fork 出来的 session id、模型、preset），session id 默认由 `qgent:<appId>:<scope>:<peerId>:<代数>` 哈希出来——代数一变，下一条消息就新建会话，而不是 resume 旧的。
 
 投递走宿主自己的 `sessionController.prompt`，所以消息在会话记录里留痕、可回放，和网页端发消息是同一套机制。
 
@@ -103,6 +109,7 @@ QQ SDK 依赖 `@tencent-connect/qqbot-nodejs`。插件会依次从「宿主解�
 - **连接状态**：绿点=已连上 QQ，旁边是 AppID；没连上会显示原因。
 - **行为**：群里是否只回 @、新消息投递方式（steer / queue）、没调用 `qq_send` 时是否补发最后一条、调试日志。
 - **模型与 preset**：留空就用宿主默认。
+- **工作目录（cwd）**：agent 干活的位置，留空用宿主默认。只影响**新建**会话；已经存在的会话保持原目录，换目录用 `/new`。
 - **人设 / 额外提示词**：群聊、私聊各一份，会追加到通道说明后面。
 - **服务范围**：私聊 / 群聊的开放、白名单、禁用。
 - **凭据**：手填 AppID / AppSecret 会写进 qgent 自己的配置行；「解绑」清空凭据并让 qgent 保持离线。

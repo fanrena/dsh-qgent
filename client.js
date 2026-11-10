@@ -246,6 +246,7 @@ window.__ModuleLoader__.load({
           provider: form.provider ?? '',
           model: form.model ?? '',
           preset: form.preset ?? '',
+          cwd: form.cwd ?? '',
           groupPrompt: form.groupPrompt ?? '',
           directPrompt: form.directPrompt ?? '',
           access: form.access,
@@ -336,6 +337,12 @@ window.__ModuleLoader__.load({
       h(TextField, {
         label: 'agent preset', value: form.preset, placeholder: '留空 = 默认 preset',
         onChange: value => set('preset', value),
+      }),
+      h(TextField, {
+        label: '工作目录（cwd）', value: form.cwd ?? '',
+        placeholder: '留空 = 宿主默认（当前工作区）',
+        help: 'agent 在哪个目录干活。只对新建会话生效；已经存在的会话保持原目录，换目录用 /new。',
+        onChange: value => set('cwd', value),
       }),
 
       h('div', { className: 'qg-group-title' }, '人设 / 额外提示词'),

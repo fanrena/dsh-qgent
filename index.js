@@ -46,6 +46,30 @@ const MEDIA_DIR = join(STATE_DIR, 'media')
 /** Per-chat generation counters: `/new` bumps the number, which changes the session id. */
 const CHAT_STATE_FILE = join(STATE_DIR, 'chats.json')
 
+/** Package version, shown by `/version`. */
+const VERSION = (() => {
+  try {
+    return JSON.parse(readFileSync(join(HERE, 'package.json'), 'utf8')).version ?? '0.0.0'
+  } catch {
+    return '0.0.0'
+  }
+})()
+
+/** `/help` body. */
+const HELP_TEXT = [
+  '**qgent 指令**',
+  '',
+  '`/new`（`/reset` `/clear`）· 开新会话，旧记录留档',
+  '`/stop` · 打断当前回合',
+  '`/status` · 连接、会话、模型、preset、消息数',
+  '`/model [provider/model]` · 查看/切换模型（fork 保留上下文）',
+  '`/preset [id]` · 查看/选择 preset（下一条 `/new` 生效）',
+  '`/compact` · 压缩当前会话历史',
+  '`/ping` · pong',
+  '`/version` · 版本',
+  '`/help` · 这条',
+].join('\n')
+
 /** QQ passive replies are limited per inbound message; beyond this we push. */
 const PASSIVE_REPLY_LIMIT = 4
 /** A passive reply window this old is treated as expired. */
@@ -677,23 +701,38 @@ function deriveSessionId(key) {
 }
 
 /**
- * Durable per-chat generation counters.
+ * Durable per-chat state.
  *
- * `/new` bumps a chat's generation, which changes the derived session id: the
- * next message creates a fresh session instead of resuming the old one. The old
- * session's log stays on disk untouched, so its history is archived rather than
- * deleted.
+ * - `gens`: `/new` bumps the generation, which changes the derived session id.
+ * - `sessions`: a session id created by fork (model switch), overriding the
+ *   derived one until the next `/new`.
+ * - `models` / `presets`: per-chat overrides (`provider/model`, preset id).
+ *
+ * The previous session's log is never deleted; only the binding moves.
  */
 class ChatState {
   constructor(file) {
     this.file = file
-    this.data = { gens: {} }
+    this.data = { gens: {}, sessions: {}, models: {}, presets: {} }
     try {
       const parsed = JSON.parse(readFileSync(file, 'utf8'))
-      if (parsed !== null && typeof parsed === 'object' && parsed.gens !== null && typeof parsed.gens === 'object') {
-        this.data = { gens: parsed.gens }
+      if (parsed !== null && typeof parsed === 'object') {
+        for (const bucket of ['gens', 'sessions', 'models', 'presets']) {
+          if (parsed[bucket] !== null && typeof parsed[bucket] === 'object') this.data[bucket] = parsed[bucket]
+        }
       }
     } catch {}
+  }
+
+  get(bucket, chatId) {
+    const value = this.data[bucket][chatId]
+    return typeof value === 'string' && value !== '' ? value : undefined
+  }
+
+  set(bucket, chatId, value) {
+    if (typeof value === 'string' && value !== '') this.data[bucket][chatId] = value
+    else delete this.data[bucket][chatId]
+    this.save()
   }
 
   gen(chatId) {
@@ -701,15 +740,21 @@ class ChatState {
     return Number.isInteger(value) && value >= 0 ? value : 0
   }
 
+  /** Next generation; forgets the forked session id so the derived id takes over. */
   bump(chatId) {
     this.data.gens[chatId] = this.gen(chatId) + 1
+    delete this.data.sessions[chatId]
+    this.save()
+    return this.data.gens[chatId]
+  }
+
+  save() {
     try {
       mkdirSync(dirname(this.file), { recursive: true })
       writeFileSync(this.file, `${JSON.stringify(this.data, null, 2)}\n`)
     } catch {
-      // Losing the counter only means a restart resumes the previous generation.
+      // Losing the file only means a restart falls back to the previous binding.
     }
-    return this.data.gens[chatId]
   }
 }
 
@@ -810,11 +855,13 @@ class QQSessionManager {
 
   async open({ key, scope, peerId, senderId, label, replyTarget }) {
     const agents = this.ctx.agents
-    const sessionId = deriveSessionId(key)
-    const composed = await this.composePreset()
+    const chatId = chatKey(scope, peerId)
+    // A forked session (model switch) overrides the derived id until `/new`.
+    const sessionId = this.state.get('sessions', chatId) ?? deriveSessionId(key)
+    const composed = await this.composePreset(scope, peerId)
     // A session without a model breaks prompt sections that read {{model}},
     // so always pin the configured or host-default route on create and resume.
-    const route = this.resolveRoute()
+    const route = this.resolveRoute(scope, peerId)
     let agent
     let handle
     const live = agents.get(sessionId)
@@ -862,6 +909,7 @@ class QQSessionManager {
       replyTarget,
       agent,
       handle,
+      agentPreset: composed.agentPreset,
       cwd: this.cwd,
       lastActivity: Date.now(),
     }
@@ -869,11 +917,13 @@ class QQSessionManager {
     return record
   }
 
-  async composePreset() {
+  async composePreset(scope, peerId) {
     const presets = this.ctx.get('agentPresets')
     if (presets === undefined) return {}
+    const override = this.state.get('presets', chatKey(scope, peerId))
+    const presetId = override ?? (this.config.preset === '' ? undefined : this.config.preset)
     try {
-      const resolved = await presets.resolve(this.config.preset === '' ? undefined : this.config.preset)
+      const resolved = await presets.resolve(presetId)
       return {
         agentPreset: resolved.id,
         setup: async agentCtx => {
@@ -881,13 +931,20 @@ class QQSessionManager {
         },
       }
     } catch (error) {
-      this.log.warn(`qgent: preset ${this.config.preset || '(default)'} unavailable: ${error instanceof Error ? error.message : String(error)}`)
+      this.log.warn(`qgent: preset ${presetId || '(default)'} unavailable: ${error instanceof Error ? error.message : String(error)}`)
       return {}
     }
   }
 
   /** The model route a new or resumed session runs on. */
-  resolveRoute() {
+  resolveRoute(scope, peerId) {
+    const override = this.state.get('models', chatKey(scope, peerId))
+    if (override !== undefined) {
+      const slash = override.indexOf('/')
+      if (slash > 0 && slash < override.length - 1) {
+        return { provider: override.slice(0, slash), model: override.slice(slash + 1) }
+      }
+    }
     if (this.config.provider !== '' && this.config.model !== '') {
       return { provider: this.config.provider, model: this.config.model }
     }
@@ -929,6 +986,134 @@ class QQSessionManager {
     }
     if (mode === 'steer') record.agent.steer(message)
     else record.agent.followup(message)
+  }
+
+  /** Fork the bound session onto another model, keeping the conversation. */
+  async switchModel(scope, peerId, route) {
+    const record = this.currentRecord(scope, peerId)
+    if (record === undefined) throw new Error('这个聊天还没有活动会话，先随便发一条消息')
+    const sessionsService = this.ctx.get('sessions')
+    if (sessionsService === undefined || typeof sessionsService.fork !== 'function') {
+      throw new Error('宿主没有 fork 能力，换不了模型')
+    }
+    let seed
+    try {
+      seed = sessionsService.fork(record.agent.session).events
+    } catch (error) {
+      throw new Error(`fork 失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+    const composed = await this.composePreset(scope, peerId)
+    const childId = randomUUID()
+    const created = await this.ctx.agents.create({
+      sessionId: childId,
+      seed,
+      meta: {
+        cwd: record.cwd,
+        parentSession: record.sessionId,
+        seedLength: seed.length,
+        ...(composed.agentPreset === undefined ? {} : { agentPreset: composed.agentPreset }),
+      },
+      agentOptions: route,
+      ...(composed.setup === undefined ? {} : { setup: composed.setup }),
+    })
+    const oldHandle = record.handle
+    record.sessionId = childId
+    record.agent = created.agent
+    record.handle = created
+    this.state.set('sessions', chatKey(scope, peerId), childId)
+    this.state.set('models', chatKey(scope, peerId), `${route.provider}/${route.model}`)
+    if (oldHandle !== undefined) Promise.resolve(oldHandle.dispose?.()).catch(() => {})
+    this.log.info(`qgent: model switched for ${chatKey(scope, peerId)} → ${route.provider}/${route.model} (fork ${childId})`)
+    return childId
+  }
+
+  /** Render the routable model catalog for `/model`. */
+  async listModels(scope, peerId) {
+    const current = this.resolveRoute(scope, peerId)
+    const lines = [`当前模型：${current === undefined ? '宿主默认' : `${current.provider}/${current.model}`}`]
+    const llm = this.ctx.get('llm')
+    const entries = []
+    try {
+      const providers = typeof llm?.listProviders === 'function' ? llm.listProviders() : []
+      for (const provider of providers) {
+        const id = typeof provider === 'string' ? provider : provider?.id
+        if (typeof id !== 'string' || id === '') continue
+        const models = await llm.listModels(id)
+        for (const model of models ?? []) {
+          if (model?.id) entries.push(`${id}/${model.id}`)
+        }
+      }
+    } catch {}
+    if (entries.length === 0) {
+      lines.push('这个部署拿不到模型目录，直接发 `/model provider/model` 指定。')
+      return lines.join('\n')
+    }
+    const head = entries.slice(0, 20)
+    lines.push('', ...head.map(entry => `- ${entry}`))
+    if (entries.length > head.length) lines.push(`…共 ${entries.length} 个，用 \`/model provider/model\` 指定`)
+    return lines.join('\n')
+  }
+
+  /** Render the preset catalog for `/preset`. */
+  async listPresets() {
+    const presets = this.ctx.get('agentPresets')
+    if (presets === undefined) return '这个部署没有 preset 服务。'
+    try {
+      const list = await presets.list()
+      return [
+        '可用 preset：',
+        ...list.map(item => `- ${item.id}${item.name ? ` · ${item.name}` : ''}`),
+        '',
+        '用 `/preset <id>` 选择，下一条 `/new` 生效',
+      ].join('\n')
+    } catch (error) {
+      return `读取 preset 失败：${error instanceof Error ? error.message : String(error)}`
+    }
+  }
+
+  /** Persist a per-chat preset override (applies when the next session starts). */
+  async setPreset(scope, peerId, presetId) {
+    const presets = this.ctx.get('agentPresets')
+    if (presets === undefined) throw new Error('这个部署没有 preset 服务')
+    const resolved = await presets.resolve(presetId)
+    this.state.set('presets', chatKey(scope, peerId), resolved.id)
+    return resolved.id
+  }
+
+  /** In-place compaction of the bound session. */
+  async compact(scope, peerId) {
+    const record = this.currentRecord(scope, peerId)
+    if (record === undefined) return '当前没有活跃会话。'
+    if (record.agent.status !== 'idle') return '正在生成中，等这轮结束再压缩。'
+    let compaction
+    try {
+      const presets = this.ctx.get('agentPresets')
+      compaction = presets?.serviceFor(record.agent, 'compaction') ?? this.ctx.get('compaction')
+    } catch {}
+    if (compaction === undefined) return '这个会话的 preset 没挂 compaction 服务。'
+    const route = this.resolveRoute(scope, peerId)
+    try {
+      const result = await compaction.compactNow({
+        session: record.agent.session,
+        options: route === undefined ? {} : { provider: route.provider, model: route.model },
+        runMaintenance: record.agent.runMaintenance.bind(record.agent),
+      }, AbortSignal.timeout(120_000))
+      if (result === null) return '没有可压缩的历史。'
+      return `✅ 已压缩 ${result.shadowedSeqs?.length ?? 0} 条历史（约 ${result.shadowedTokenCount ?? 0} tokens）`
+    } catch (error) {
+      return `压缩失败：${error instanceof Error ? error.message : String(error)}`
+    }
+  }
+
+  /** Count conversational events in one session (for `/status`). */
+  messageCount(record) {
+    const events = record?.agent?.session?.events
+    if (!Array.isArray(events)) return 0
+    let total = 0
+    for (const event of events) {
+      if (event.type === 'user/message' || event.type === 'assistant/message') total += 1
+    }
+    return total
   }
 
   /** Dispose sessions idle for longer than the configured timeout. */
@@ -1146,26 +1331,13 @@ class QQChannel {
     const entry = this.chats.get(chatKey(scope, peerId))
     // /new (alias /reset) rebinds the chat to a fresh session; /stop cancels the
     // running turn. Both are handled here, before the model ever sees the text.
-    const command = /^\/(new|reset|stop)\b\s*([\s\S]*)$/i.exec(parsed.text)
+    const command = /^\/(new|reset|clear|stop|status|model|preset|compact|ping|version|help|bot-help)\b\s*([\s\S]*)$/i.exec(parsed.text)
     if (command !== null) {
-      const word = command[1].toLowerCase()
-      if (word === 'stop') {
-        const record = this.sessions.currentRecord(scope, peerId)
-        if (record === undefined) {
-          await this.sendText(entry, '现在没有在跑的回合。').catch(() => {})
-          return
-        }
-        try {
-          record.agent.cancel({ kind: 'user' })
-        } catch {}
-        await this.sendText(entry, '⏹ 已打断当前回合。').catch(() => {})
-        return
+      const outcome = await this.runCommand(command[1].toLowerCase(), command[2].trim(), scope, peerId, entry)
+      if (outcome.handled) {
+        if (outcome.text === undefined || outcome.text === '') return
+        parsed = { text: outcome.text, mode: parsed.mode }
       }
-      const generation = await this.sessions.rotate(scope, peerId)
-      await this.sendText(entry, `🔄 新会话（第 ${generation + 1} 代）。旧记录还在磁盘上，只是不再参与。`).catch(() => {})
-      const rest = command[2].trim()
-      if (rest === '') return
-      parsed = { text: rest, mode: parsed.mode }
     }
     const body = await composeInbound({
       message,
@@ -1199,6 +1371,109 @@ class QQChannel {
       this.log.error(`qgent: delivery failed: ${detail}`)
       const entry = this.chats.get(chatKey(scope, peerId))
       if (entry !== undefined) await this.sendText(entry, `⚠️ 消息没送进 agent：${detail}`).catch(() => {})
+    }
+  }
+
+  /**
+   * Slash commands, handled before a message ever reaches the model.
+   * @returns `{ handled: true, text? }`; `text` is delivered into the session
+   *   (only `/new` with trailing text does that).
+   */
+  async runCommand(word, rest, scope, peerId, entry) {
+    const reply = text => this.sendText(entry, text)
+    const record = this.sessions.currentRecord(scope, peerId)
+    switch (word) {
+      case 'new':
+      case 'reset':
+      case 'clear': {
+        const generation = await this.sessions.rotate(scope, peerId)
+        await reply(`🔄 新会话（第 ${generation + 1} 代）。旧记录还在磁盘上，只是不再参与。`)
+        return { handled: true, text: rest }
+      }
+      case 'stop': {
+        if (record === undefined) {
+          await reply('现在没有在跑的回合。')
+          return { handled: true }
+        }
+        try {
+          record.agent.cancel({ kind: 'user' })
+        } catch {}
+        await reply('⏹ 已打断当前回合。')
+        return { handled: true }
+      }
+      case 'status': {
+        const route = this.sessions.resolveRoute(scope, peerId)
+        const preset = record?.agentPreset ?? (this.config.preset !== '' ? this.config.preset : '默认')
+        await reply([
+          `QQ：${this.ready ? '已连接' : '未连接'}（appId ${this.config.appId}）`,
+          `会话：${record === undefined ? '(还没建立)' : `${shortId(record.sessionId)} · ${record.agent.status}`}`,
+          `模型：${route === undefined ? '宿主默认' : `${route.provider}/${route.model}`}`,
+          `preset：${preset}`,
+          `消息：${this.sessions.messageCount(record)} 条`,
+          `投递：${this.config.mode}${this.config.fallbackReply ? ' · 兜底补发开' : ''}`,
+        ].join('\n'))
+        return { handled: true }
+      }
+      case 'model': {
+        if (rest === '') {
+          await reply(await this.sessions.listModels(scope, peerId))
+          return { handled: true }
+        }
+        const fallback = this.sessions.resolveRoute(scope, peerId)
+        let provider
+        let model
+        if (rest.includes('/')) {
+          const slash = rest.indexOf('/')
+          provider = rest.slice(0, slash)
+          model = rest.slice(slash + 1)
+        } else {
+          provider = fallback?.provider
+          model = rest
+        }
+        if (!provider || !model) {
+          await reply('用法：`/model provider/model`')
+          return { handled: true }
+        }
+        try {
+          const childId = await this.sessions.switchModel(scope, peerId, { provider, model })
+          await reply(`✅ 模型已换成 ${provider}/${model}，上下文 fork 保留（${shortId(childId)}）`)
+        } catch (error) {
+          await reply(`切换失败：${error instanceof Error ? error.message : String(error)}`)
+        }
+        return { handled: true }
+      }
+      case 'preset': {
+        if (rest === '') {
+          await reply(await this.sessions.listPresets())
+          return { handled: true }
+        }
+        try {
+          const id = await this.sessions.setPreset(scope, peerId, rest)
+          await reply(`✅ preset 记为 ${id}，下一条 /new 生效`)
+        } catch (error) {
+          await reply(`设置失败：${error instanceof Error ? error.message : String(error)}`)
+        }
+        return { handled: true }
+      }
+      case 'compact': {
+        await reply(await this.sessions.compact(scope, peerId))
+        return { handled: true }
+      }
+      case 'ping': {
+        await reply('pong 🏓')
+        return { handled: true }
+      }
+      case 'version': {
+        await reply(`qgent ${VERSION}`)
+        return { handled: true }
+      }
+      case 'help':
+      case 'bot-help': {
+        await reply(HELP_TEXT)
+        return { handled: true }
+      }
+      default:
+        return { handled: false }
     }
   }
 
@@ -1475,6 +1750,7 @@ function sanitizeUiPatch(body) {
       case 'groupPrompt':
       case 'directPrompt':
       case 'mode':
+      case 'cwd':
         if (typeof value !== 'string') fail(`${key} must be a string`)
         if (value.length > 20000) fail(`${key} is too long`)
         out[key] = value
