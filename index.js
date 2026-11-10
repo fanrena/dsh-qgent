@@ -1008,12 +1008,23 @@ class QQChannel {
       this.ready = true
       this.log.info('qgent: QQ bot ready')
     })
+    // A gateway RESUME (normal after a blip) only emits `resumed`, never `ready`;
+    // treating it as connected keeps the status endpoint honest.
+    bot.on('resumed', () => {
+      this.ready = true
+      this.log.info('qgent: QQ bot session resumed')
+    })
     try {
       bot.on('disconnected', event => {
-        this.ready = false
         const detail = `${event?.code ?? '?'}${event?.reason ? ` ${event.reason}` : ''}`
-        if (event?.willReconnect === false) this.log.error(`qgent: QQ bot disconnected for good (${detail})`)
-        else this.log.warn(`qgent: QQ bot disconnected (${detail}), reconnecting`)
+        if (event?.willReconnect === false) {
+          this.ready = false
+          this.log.error(`qgent: QQ bot disconnected for good (${detail})`)
+        } else {
+          // The SDK reconnects on its own; keep the flag and let `resumed` (or the
+          // next inbound message) confirm liveness instead of flapping to offline.
+          this.log.warn(`qgent: QQ bot disconnected (${detail}), reconnecting`)
+        }
       })
     } catch {
       // Older SDKs do not know this event; nothing to observe there.
@@ -1050,6 +1061,8 @@ class QQChannel {
 
   /** One inbound QQ message → one prompt delivered into its session. */
   async onMessage(mCtx) {
+    // A message proves the gateway path is alive; self-heal the status flag.
+    this.ready = true
     const message = mCtx.message
     const scope = message.kind === 'group' ? 'group' : message.kind === 'c2c' ? 'c2c' : undefined
     if (scope === undefined) return
