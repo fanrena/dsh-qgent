@@ -25,7 +25,7 @@
 
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { promises as dns } from 'node:dns'
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve as resolvePath, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -854,6 +854,7 @@ class QQSessionManager {
     const record = this.currentRecord(scope, peerId)
     if (record !== undefined) {
       this.approvals?.cancel(record.sessionId)
+      this.questions?.cancel(record.sessionId)
       this.sessions.delete(record.key)
       try {
         record.agent.cancel({ kind: 'user' })
@@ -1176,6 +1177,7 @@ class QQSessionManager {
       if (now - record.lastActivity < this.config.sessionIdleTimeout) continue
       if (record.agent.status !== 'idle') continue
       this.approvals?.cancel(record.sessionId)
+      this.questions?.cancel(record.sessionId)
       this.sessions.delete(record.key)
       try {
         record.agent.cancel({ kind: 'user' })
@@ -1190,6 +1192,7 @@ class QQSessionManager {
     this.sessions.clear()
     for (const record of records) {
       this.approvals?.cancel(record.sessionId)
+      this.questions?.cancel(record.sessionId)
       try {
         record.agent.cancel({ kind: 'user' })
       } catch {}
@@ -1268,14 +1271,29 @@ class ApprovalChannel {
     this.counter = 0
   }
 
+  /** Append one diagnostic line; the host console is not readable from outside. */
+  logLine(message) {
+    try {
+      mkdirSync(STATE_DIR, { recursive: true })
+      appendFileSync(join(STATE_DIR, 'approval.log'), `${new Date().toISOString()} ${message}\n`)
+    } catch {}
+  }
+
   install(ctx) {
-    ctx.on('approval/request', (request, next) => {
+    ctx.on('approval/request', async (request, next) => {
       const record = this.channel.sessions.bySessionId(request?.agent?.id)
+      this.logLine(`request agent=${request?.agent?.id ?? '?'} tool=${request?.toolName ?? '?'} record=${record === undefined ? 'none' : 'found'}`)
       if (record === undefined) return next()
-      return this.park(record, request).catch(error => {
-        this.log.error(`qgent: approval failed: ${error instanceof Error ? error.message : String(error)}`)
-        return 'unavailable'
-      })
+      try {
+        const outcome = await this.park(record, request)
+        this.logLine(`outcome=${outcome}`)
+        // Could not present the request in QQ: let the host's own answerers ask.
+        if (outcome === 'unavailable') return next()
+        return outcome
+      } catch (error) {
+        this.logLine(`park failed: ${error instanceof Error ? error.message : String(error)}`)
+        return next()
+      }
     }, { global: true, prepend: true })
   }
 
@@ -1377,6 +1395,150 @@ class ApprovalChannel {
 }
 
 /**
+ * Ask the QQ user the questions the agent puts to the user (`ask_user_question`).
+ *
+ * The host emits `user-questions/request`; for a QQ-bound agent we render the
+ * question as a QQ message, park the Promise, and feed the chat reply back as
+ * `{answers: [{id, selected, custom?}]}`.
+ */
+class QuestionChannel {
+  constructor(channel, log) {
+    this.channel = channel
+    this.log = log
+    this.pending = new Map()
+  }
+
+  install(ctx) {
+    ctx.on('user-questions/request', async (request, next) => {
+      const record = this.channel.sessions.bySessionId(request?.agent?.id)
+      if (record === undefined) return next()
+      const questions = Array.isArray(request.questions) ? request.questions : []
+      if (questions.length === 0) return next()
+      try {
+        return await this.ask(record, request, questions)
+      } catch (error) {
+        this.log.error(`qgent: question failed: ${error instanceof Error ? error.message : String(error)}`)
+        return next()
+      }
+    }, { global: true, prepend: true })
+  }
+
+  ask(record, request, questions) {
+    const key = record.sessionId
+    if (request.signal?.aborted) throw questionError('提问在送达前被取消了', 'ASK_ABORTED')
+    const previous = this.pending.get(key)
+    if (previous !== undefined) {
+      this.pending.delete(key)
+      previous.finish()
+      previous.reject(questionError('被新的提问取代了', 'ASK_ABORTED'))
+    }
+    return this.send(record, questions[0]).then(() => new Promise((resolve, reject) => {
+      const entry = { record, request, questions, index: 0, answers: [], resolve, reject, cleanup: () => {} }
+      const timer = setTimeout(() => this.timeout(key), 5 * 60_000)
+      timer.unref?.()
+      const onAbort = () => this.cancel(key)
+      request.signal?.addEventListener?.('abort', onAbort, { once: true })
+      entry.finish = () => {
+        clearTimeout(timer)
+        request.signal?.removeEventListener?.('abort', onAbort)
+      }
+      this.pending.set(key, entry)
+    }))
+  }
+
+  async send(record, question) {
+    const options = Array.isArray(question.options) ? question.options : []
+    const lines = []
+    if (typeof question.header === 'string' && question.header !== '') lines.push(`**${question.header}**`)
+    lines.push(`${question.question}${question.multiSelect === true ? '（可多选）' : ''}`)
+    options.forEach((option, index) => {
+      lines.push(`${index + 1}. ${option.label}${option.description ? ` · ${option.description}` : ''}`)
+    })
+    lines.push('', options.length > 0 ? '回复编号，或直接回选项文字/自定义答案。' : '直接回复答案。')
+    await this.channel.sendText(this.channel.entryFor(record), lines.join('\n'))
+  }
+
+  advance(entry, key, answer) {
+    entry.answers.push(answer)
+    entry.index += 1
+    if (entry.index < entry.questions.length) {
+      const next = entry.questions[entry.index]
+      void this.send(entry.record, next).catch(error => {
+        this.pending.delete(key)
+        entry.finish()
+        entry.reject(error instanceof Error ? error : new Error(String(error)))
+      })
+      return
+    }
+    this.pending.delete(key)
+    entry.finish()
+    this.log.info(`qgent: question ${shortId(key)} answered via QQ`)
+    entry.resolve({ answers: entry.answers })
+  }
+
+  timeout(key) {
+    const entry = this.pending.get(key)
+    if (entry === undefined) return
+    this.pending.delete(key)
+    entry.finish()
+    void this.channel.sendText(this.channel.entryFor(entry.record), '⚠️ 提问超时，没等到回答。').catch(() => {})
+    entry.reject(questionError('用户没有在超时前回答', 'ASK_TIMED_OUT'))
+  }
+
+  /** Resolve a pending question; used when the session is rotated or evicted. */
+  cancel(sessionId) {
+    const entry = this.pending.get(sessionId)
+    if (entry === undefined) return
+    this.pending.delete(sessionId)
+    entry.finish()
+    entry.reject(questionError('提问被取消了', 'ASK_ABORTED'))
+  }
+
+  /**
+   * Interpret a QQ message as an answer to the pending question.
+   * @returns true when the message was consumed as an answer.
+   */
+  handle(record, text) {
+    const entry = this.pending.get(record.sessionId)
+    if (entry === undefined) return false
+    const question = entry.questions[entry.index]
+    if (question === undefined) return false
+    const value = String(text ?? '').trim()
+    if (value === '') return false
+    this.advance(entry, record.sessionId, parseQuestionAnswer(question, value))
+    return true
+  }
+}
+
+/** An error the question service understands (it checks `code`). */
+function questionError(message, code) {
+  const error = new Error(message)
+  error.code = code
+  error.name = 'UserQuestionError'
+  return error
+}
+
+/** Parse one chat reply into the answer shape the question service expects. */
+function parseQuestionAnswer(question, text) {
+  const options = Array.isArray(question.options) ? question.options : []
+  if (options.length > 0) {
+    if (/^[\d\s,，、;；./]+$/.test(text)) {
+      const picked = [...text.matchAll(/\d+/g)]
+        .map(match => Number.parseInt(match[0], 10))
+        .filter(value => value >= 1 && value <= options.length)
+      if (picked.length > 0) {
+        const chosen = question.multiSelect === true ? picked : picked.slice(0, 1)
+        const selected = [...new Set(chosen.map(value => options[value - 1]?.label).filter(label => typeof label === 'string'))]
+        return { id: question.id, selected }
+      }
+    }
+    const exact = options.find(option => option.label.toLowerCase() === text.toLowerCase())
+    if (exact !== undefined) return { id: question.id, selected: [exact.label] }
+  }
+  return { id: question.id, selected: [], custom: text }
+}
+
+/**
  * The QQ side: one SDK bot, the middleware chain the SDK ships, the inbound
  * handler that turns messages into session prompts, and the outbound helpers
  * the tools use.
@@ -1394,6 +1556,7 @@ class QQChannel {
     this.startError = ''
     this.credentialSource = ''
     this.approvals = undefined
+    this.questions = undefined
   }
 
   async start() {
@@ -1516,6 +1679,7 @@ class QQChannel {
     const entry = this.chats.get(chatKey(scope, peerId))
     // A pending approval is answered in plain chat text ("/approve 1", "允许"…).
     const approvalRecord = this.sessions.currentRecord(scope, peerId)
+    if (approvalRecord !== undefined && this.questions !== undefined && this.questions.handle(approvalRecord, parsed.text)) return
     if (approvalRecord !== undefined && this.approvals !== undefined && this.approvals.handle(approvalRecord, parsed.text)) return
     // /new (alias /reset) rebinds the chat to a fresh session; /stop cancels the
     // running turn. Both are handled here, before the model ever sees the text.
@@ -2149,9 +2313,13 @@ export function apply(ctx, config) {
   // Approval requests are answered from the QQ chat; sessions cancel their
   // pending approval when they are rotated or evicted.
   const approvals = new ApprovalChannel(channel, log)
+  const questions = new QuestionChannel(channel, log)
   channel.approvals = approvals
+  channel.questions = questions
   sessions.approvals = approvals
+  sessions.questions = questions
   approvals.install(ctx)
+  questions.install(ctx)
 
   /** The QQ binding of one agent, when it has one. */
   const recordOf = agent => sessions.findByAgent(agent) ?? sessions.bySessionId(agent?.id)
