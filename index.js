@@ -65,6 +65,7 @@ const HELP_TEXT = [
   '`/model [provider/model]` · 查看/切换模型（fork 保留上下文）',
   '`/preset [id]` · 查看/选择 preset（下一条 `/new` 生效）',
   '`/compact` · 压缩当前会话历史',
+  '`/approve [编号]` / `/deny [编号]` · 批准/拒绝待审批的操作',
   '`/ping` · pong',
   '`/version` · 版本',
   '`/help` · 这条',
@@ -852,6 +853,7 @@ class QQSessionManager {
   async rotate(scope, peerId) {
     const record = this.currentRecord(scope, peerId)
     if (record !== undefined) {
+      this.approvals?.cancel(record.sessionId)
       this.sessions.delete(record.key)
       try {
         record.agent.cancel({ kind: 'user' })
@@ -1173,6 +1175,7 @@ class QQSessionManager {
     for (const record of [...this.sessions.values()]) {
       if (now - record.lastActivity < this.config.sessionIdleTimeout) continue
       if (record.agent.status !== 'idle') continue
+      this.approvals?.cancel(record.sessionId)
       this.sessions.delete(record.key)
       try {
         record.agent.cancel({ kind: 'user' })
@@ -1186,6 +1189,7 @@ class QQSessionManager {
     const records = [...this.sessions.values()]
     this.sessions.clear()
     for (const record of records) {
+      this.approvals?.cancel(record.sessionId)
       try {
         record.agent.cancel({ kind: 'user' })
       } catch {}
@@ -1249,6 +1253,130 @@ class TurnTracker {
 // ────────────────────────────────────────────────────────────────────────────
 
 /**
+ * Ask the QQ side for approvals.
+ *
+ * The host's approval service asks `approval/request`; for a QQ-bound agent the
+ * request is parked here, rendered as a QQ message with a short code, and the
+ * user answers in the chat (`/approve 1` or `/deny 1`). Anything that cannot be
+ * rendered fails closed with `unavailable`.
+ */
+class ApprovalChannel {
+  constructor(channel, log) {
+    this.channel = channel
+    this.log = log
+    this.pending = new Map()
+    this.counter = 0
+  }
+
+  install(ctx) {
+    ctx.on('approval/request', (request, next) => {
+      const record = this.channel.sessions.bySessionId(request?.agent?.id)
+      if (record === undefined) return next()
+      return this.park(record, request).catch(error => {
+        this.log.error(`qgent: approval failed: ${error instanceof Error ? error.message : String(error)}`)
+        return 'unavailable'
+      })
+    }, { global: true, prepend: true })
+  }
+
+  /** Find the gated command in the session log (the request itself has no args). */
+  commandOf(request) {
+    const callId = request?.callId
+    if (callId === undefined) return undefined
+    const events = request.agent?.session?.events
+    if (!Array.isArray(events)) return undefined
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const event = events[index]
+      if (event?.type !== 'tool/call') continue
+      if (String(event.data?.callId) !== String(callId)) continue
+      const raw = event.data?.arguments
+      if (typeof raw !== 'string') return undefined
+      try {
+        const parsed = JSON.parse(raw)
+        if (typeof parsed?.command === 'string') return parsed.command
+      } catch {}
+      return raw.length <= 500 ? raw : `${raw.slice(0, 500)}…`
+    }
+    return undefined
+  }
+
+  async park(record, request) {
+    if (request.signal?.aborted) return 'cancelled'
+    const key = record.sessionId
+    const previous = this.pending.get(key)
+    if (previous !== undefined) {
+      this.pending.delete(key)
+      previous.settle('cancelled')
+    }
+    this.counter += 1
+    const code = String(this.counter)
+    const command = this.commandOf(request)
+    const text = [
+      '🔐 需要你批准一个操作',
+      `工具：${request.toolName ?? 'unknown'}`,
+      ...(command === undefined ? [] : ['', '```', command, '```']),
+      ...(request.reason === undefined || request.reason === '' ? [] : ['', `说明：${request.reason}`]),
+      '',
+      `回复 \`/approve ${code}\` 允许一次，或 \`/deny ${code}\` 拒绝。`,
+    ].join('\n')
+    try {
+      await this.channel.sendText(this.channel.entryFor(record), text)
+    } catch (error) {
+      this.log.error(`qgent: approval send failed: ${error instanceof Error ? error.message : String(error)}`)
+      return 'unavailable'
+    }
+    return new Promise(resolve => {
+      let done = false
+      const timer = setTimeout(() => settle('cancelled'), 5 * 60_000)
+      timer.unref?.()
+      const settle = outcome => {
+        if (done) return
+        done = true
+        clearTimeout(timer)
+        request.signal?.removeEventListener?.('abort', onAbort)
+        this.pending.delete(key)
+        resolve(outcome)
+      }
+      const onAbort = () => settle('cancelled')
+      request.signal?.addEventListener?.('abort', onAbort, { once: true })
+      this.pending.set(key, { code, settle })
+      this.log.info(`qgent: approval #${code} sent to QQ for ${shortId(key)}`)
+    })
+  }
+
+  /** Resolve a pending approval; used when the session is rotated or evicted. */
+  cancel(sessionId) {
+    const entry = this.pending.get(sessionId)
+    if (entry === undefined) return
+    entry.settle('cancelled')
+  }
+
+  /**
+   * Interpret a QQ message as an approval answer.
+   * @returns true when the message was consumed as an approval decision.
+   */
+  handle(record, text) {
+    const entry = this.pending.get(record.sessionId)
+    if (entry === undefined) return false
+    const parts = String(text ?? '').trim().split(/\s+/)
+    const word = (parts[0] ?? '').toLowerCase().replace(/^\//, '')
+    const code = parts[1]
+    if (code !== undefined && code !== entry.code) return false
+    if (['approve', 'allow', 'yes', 'y', '允许', '同意', '准'].includes(word)) {
+      entry.settle('allowed-once')
+      void this.channel.sendText(this.channel.entryFor(record), '✅ 已允许这一次。')
+      return true
+    }
+    if (['deny', 'reject', 'no', 'n', '拒绝', '不同意', '不准'].includes(word)) {
+      entry.settle('rejected')
+      void this.channel.sendText(this.channel.entryFor(record), '⛔ 已拒绝。')
+      return true
+    }
+    return false
+  }
+}
+
+/**
  * The QQ side: one SDK bot, the middleware chain the SDK ships, the inbound
  * handler that turns messages into session prompts, and the outbound helpers
  * the tools use.
@@ -1265,6 +1393,7 @@ class QQChannel {
     this.ready = false
     this.startError = ''
     this.credentialSource = ''
+    this.approvals = undefined
   }
 
   async start() {
@@ -1385,6 +1514,9 @@ class QQChannel {
     const replyTarget = { scope, targetId: peerId, msgId: message.messageId }
     this.chats.touch({ scope, peerId, label: chatLabel, msgId: message.messageId })
     const entry = this.chats.get(chatKey(scope, peerId))
+    // A pending approval is answered in plain chat text ("/approve 1", "允许"…).
+    const approvalRecord = this.sessions.currentRecord(scope, peerId)
+    if (approvalRecord !== undefined && this.approvals !== undefined && this.approvals.handle(approvalRecord, parsed.text)) return
     // /new (alias /reset) rebinds the chat to a fresh session; /stop cancels the
     // running turn. Both are handled here, before the model ever sees the text.
     const command = /^\s*(?:<@[^>]{1,64}>\s*)*\/(new|reset|clear|stop|status|model|preset|compact|ping|version|help|bot-help)\b\s*([\s\S]*)$/i.exec(parsed.text)
@@ -2014,6 +2146,12 @@ export function apply(ctx, config) {
   const sessions = new QQSessionManager(ctx, settings, log, chats)
   const channel = new QQChannel(ctx, settings, log, sessions, chats)
   const tracker = new TurnTracker()
+  // Approval requests are answered from the QQ chat; sessions cancel their
+  // pending approval when they are rotated or evicted.
+  const approvals = new ApprovalChannel(channel, log)
+  channel.approvals = approvals
+  sessions.approvals = approvals
+  approvals.install(ctx)
 
   /** The QQ binding of one agent, when it has one. */
   const recordOf = agent => sessions.findByAgent(agent) ?? sessions.bySessionId(agent?.id)

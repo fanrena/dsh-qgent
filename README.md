@@ -50,6 +50,7 @@
 | `/model [provider/model]` | 不带参数列可用模型；带参数换模型（fork 当前会话，上下文保留） |
 | `/preset [id]` | 列 preset / 选 preset，**下一条 `/new` 生效**（已开始的会话不换） |
 | `/compact` | 原地压缩当前会话历史，返回压缩条数/tokens |
+| `/approve [编号]` / `/deny [编号]` | 批准 / 拒绝一个待审批操作（见下） |
 | `/ping` `/version` | pong / 版本号 |
 | `/help`（`/bot-help`） | 命令表 |
 
@@ -156,6 +157,28 @@ QQ SDK 依赖 `@tencent-connect/qqbot-nodejs`。插件会依次从「宿主解�
 - 群聊里如果有**别的机器人**也在说话，QQ 又把这些消息投给本 bot，两个 bot 会互相接话、上下文越滚越重复，最后模型可能退化成复读或乱吐字符。qgent 没有做 bot 消息过滤或入站限流（`skipSelfEcho: false`），真出现对刷就把其中一个 bot 移出群，或者用 `/stop` 打断。
 - `steer` 的"下一步"取决于 agent 当前这一步什么时候结束：模型正在生成长回答时，插话要等这次生成结束。
 - 会话的 preset 在首次创建时确定；之后改 `preset` 只影响新会话。
+
+### 审批（agent 请求权限）
+
+当宿主需要用户批准某个操作（例如执行一条命令），qgent 会把请求发到对应的 QQ 聊天：
+
+```
+🔐 需要你批准一个操作
+工具：bash
+
+```
+git push origin main
+```
+
+说明：……
+
+回复 `/approve 1` 允许一次，或 `/deny 1` 拒绝。
+```
+
+- 批准只对**这一次**生效（宿主只提供 `allowed-once`，没有“总是允许”）。
+- 编号是全局递增的；只回 `/approve` 不带编号也行，前提是当前聊天只有一个待审批。
+- 5 分钟没回、或那轮被 `/stop`/`/new` 取消，审批按取消处理，agent 收到拒绝/取消的结果。
+- 请求发不出去（QQ 断线等）时 fail-closed，返回 `unavailable`，不会默认放行。
 
 ### 被动回复的次数上限（QQ 平台限制，绕不过去）
 
