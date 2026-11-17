@@ -86,6 +86,9 @@ assistant → qq_send("修好了，测试全绿")
 ## 安装
 
 ```bash
+# 从 npm 装
+dsh plugin add dsh-qgent
+
 # 从仓库装（DSH 会把它挂进当前 profile）
 dsh plugin install https://github.com/fanrena/dsh-qgent
 
