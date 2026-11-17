@@ -1683,7 +1683,11 @@ class QQChannel {
     if (approvalRecord !== undefined && this.approvals !== undefined && this.approvals.handle(approvalRecord, parsed.text)) return
     // /new (alias /reset) rebinds the chat to a fresh session; /stop cancels the
     // running turn. Both are handled here, before the model ever sees the text.
-    const command = /^\s*(?:<@[^>]{1,64}>\s*)*\/(new|reset|clear|stop|status|model|preset|compact|ping|version|help|bot-help)\b\s*([\s\S]*)$/i.exec(parsed.text)
+    // Commands are for the bot that was addressed: in a group only an @-mentioned
+    // bot runs them, so `<@someone-else> /new` is just text for the model.
+    const command = (scope === 'c2c' || mentioned)
+      ? /^\/(new|reset|clear|stop|status|model|preset|compact|ping|version|help|bot-help)\b\s*([\s\S]*)$/i.exec(parsed.text)
+      : null
     if (command !== null) {
       const outcome = await this.runCommand(command[1].toLowerCase(), command[2].trim(), scope, peerId, entry)
       if (outcome.handled) {
